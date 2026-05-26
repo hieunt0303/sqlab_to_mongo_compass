@@ -39,7 +39,7 @@ UPSTREAM_CSRF_TOKEN=your_csrf_token_here
 UPSTREAM_SESSION_COOKIE=your_session_cookie_here
 
 # Upstream SQL engine parameters (from Superset Query URL/Payload)
-UPSTREAM_CLIENT_ID=dFwtVCgIyg
+UPSTREAM_CLIENT_ID=********
 UPSTREAM_DATABASE_ID=54
 UPSTREAM_SQL_EDITOR_ID=188
 UPSTREAM_SCHEMA=uc_logs
