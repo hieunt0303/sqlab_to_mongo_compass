@@ -4,6 +4,9 @@ node_modules/
 jspm_packages/
 web_modules/
 
+logs/error.log
+logs/out.log
+
 # Local env files
 .env
 .env.local

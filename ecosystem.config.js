@@ -13,8 +13,6 @@ module.exports = {
         NODE_ENV: "production",
       },
       // Keep logs organized
-      output: "./logs/out.log",
-      error: "./logs/error.log",
       merge_logs: true,
       log_date_format: "YYYY-MM-DD HH:mm:ss Z",
     }
