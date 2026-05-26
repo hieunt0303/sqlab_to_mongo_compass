@@ -1,0 +1,31 @@
+{
+  "name": "sqlab_to_mongo_compass",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "test-client": "tsx src/test_client.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hieunt0303/sqlab_to_mongo_compass.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/hieunt0303/sqlab_to_mongo_compass/issues"
+  },
+  "homepage": "https://github.com/hieunt0303/sqlab_to_mongo_compass#readme",
+  "dependencies": {
+    "bson": "^7.2.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "mongodb": "^7.2.0",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
+  }
+}
