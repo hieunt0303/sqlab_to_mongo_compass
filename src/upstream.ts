@@ -540,3 +540,106 @@ export async function fetchDataFromUpstream(collectionName: string, filter: any)
     return getMockData(collectionName, phoneFilter);
   }
 }
+
+// Global cache for table names to avoid duplicate parallel requests and speed up response times
+let cachedTableNames: string[] = ['booking_check_rule_logs', 'booking_check_rule_log', 'tbl_profiles'];
+let isFetchingTables = false;
+let lastTablesFetchTime = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000; // Cache tables for 5 minutes
+
+/**
+ * Fetches the list of all tables in the configured schema from Trino/Superset.
+ */
+export async function fetchTablesListFromUpstream(): Promise<string[]> {
+  const now = Date.now();
+
+  // If the cache is fresh, return it instantly
+  if (lastTablesFetchTime > 0 && (now - lastTablesFetchTime < CACHE_TTL_MS)) {
+    return cachedTableNames;
+  }
+
+  // If already fetching, return current cache to avoid parallel connection bottlenecks
+  if (isFetchingTables) {
+    return cachedTableNames;
+  }
+
+  if (!isUpstreamConfigured()) {
+    return cachedTableNames;
+  }
+
+  isFetchingTables = true;
+  const sql = 'SHOW TABLES;';
+  const payload = {
+    client_id: generateClientId(),
+    database_id: DATABASE_ID,
+    json: true,
+    runAsync: false,
+    schema: SCHEMA,
+    sql: sql,
+    sql_editor_id: SQL_EDITOR_ID,
+    tab: "Untitled Query 8",
+    tmp_table_name: "",
+    select_as_cta: false,
+    ctas_method: "TABLE",
+    queryLimit: 10000,
+    expand_data: true,
+  };
+
+  console.log(`[Upstream] Fetching all tables in schema using SQL: "${sql}"`);
+
+  try {
+    const url = 'https://query.urbox.services/api/v1/sqllab/execute/';
+    const response = await httpRequest(url, {
+      method: 'POST',
+      headers: {
+        'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
+        'X-CSRFToken': CSRF_TOKEN,
+        'Cookie': SESSION_COOKIE.includes('=') ? SESSION_COOKIE : `session=${SESSION_COOKIE}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Referer': 'https://query.urbox.services/sqllab/',
+        'Origin': 'https://query.urbox.services',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Upstream API failed: ${response.statusText}`);
+    }
+
+    const responseData = await response.json();
+    const results = Array.isArray(responseData.data) 
+      ? responseData.data 
+      : (responseData.results || responseData.data?.results || responseData.rows || responseData.data?.rows);
+
+    if (Array.isArray(results)) {
+      const tables = results
+        .map((row: any) => {
+          if (row && typeof row === 'object' && row.Table) return String(row.Table);
+          if (Array.isArray(row) && row.length > 0) return String(row[0]);
+          if (row && typeof row === 'object') {
+            const firstKey = Object.keys(row)[0];
+            return firstKey ? String(row[firstKey]) : null;
+          }
+          return null;
+        })
+        .filter((name): name is string => typeof name === 'string' && name.length > 0);
+      
+      console.log(`[Upstream] Successfully fetched ${tables.length} tables from schema.`);
+      if (tables.length > 0) {
+        cachedTableNames = tables;
+        lastTablesFetchTime = now;
+      }
+    }
+  } catch (error: any) {
+    console.error(`[Upstream] Failed to fetch table list: ${error.message}. Using fallback table list.`);
+  } finally {
+    isFetchingTables = false;
+  }
+
+  return cachedTableNames;
+}
+

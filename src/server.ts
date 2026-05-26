@@ -8,7 +8,7 @@ import {
   OpCode,
   MsgHeader,
 } from './wire.js';
-import { fetchDataFromUpstream } from './upstream.js';
+import { fetchDataFromUpstream, fetchTablesListFromUpstream } from './upstream.js';
 
 // Load environment variables
 dotenv.config();
@@ -207,13 +207,19 @@ async function processCommand(
 
   // ListCollections Command
   if (primaryCmdLower === 'listcollections') {
+    const tableNames = await fetchTablesListFromUpstream();
+    const firstBatch = tableNames.map(name => ({
+      name: name,
+      type: 'collection',
+      options: {},
+      info: { readOnly: false }
+    }));
+
     const listColRes = {
       cursor: {
         id: 0n,
         ns: `${dbName}.$cmd.listCollections`,
-        firstBatch: [
-          { name: 'tbl_profiles', type: 'collection', options: {}, info: { readOnly: false } },
-        ],
+        firstBatch: firstBatch,
       },
       ok: 1.0,
     };
@@ -354,9 +360,29 @@ async function processCommand(
   // aggregate Command (Cursor structure wrapper for pipelines)
   if (primaryCmdLower === 'aggregate') {
     const collectionName = cmdDoc.aggregate;
+    console.log(`[Socket #${socketId}] Intercepted aggregate command for: "${collectionName}". Payload: ${JSON.stringify(cmdDoc)}`);
+    
+    // Check if the aggregation pipeline is asking for collection/storage statistics ($collStats)
+    const hasCollStats = Array.isArray(cmdDoc.pipeline) && cmdDoc.pipeline.some((stage: any) => stage && stage.$collStats);
+    
+    const firstBatch = hasCollStats 
+      ? [{
+          storageStats: {
+            capped: false,
+            count: 100,
+            size: 10240,
+            storageSize: 40960,
+            totalIndexSize: 8192,
+            freeStorageSize: 4096,
+            avgObjSize: 102,
+            nindexes: 1
+          }
+        }]
+      : [];
+
     const res = {
       cursor: {
-        firstBatch: [],
+        firstBatch: firstBatch,
         id: 0n,
         ns: `${dbName}.${collectionName}`,
       },
@@ -491,4 +517,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`${CLR_INFO}👉 Connect your MongoDB Compass to: mongodb://127.0.0.1:${PORT}/sqlab${CLR_RESET}`);
   console.log(`${CLR_INFO}👉 To test filtering: search by phone field in collection "tbl_profiles"${CLR_RESET}`);
   console.log(`${CLR_HEADER}================================================================${CLR_RESET}\n`);
+
+  // Pre-fetch all tables in the schema in the background to warm up cache immediately
+  console.log(`${CLR_INFO}[Warmup] Pre-fetching tables list from Trino in the background...${CLR_RESET}`);
+  fetchTablesListFromUpstream().catch(err => {
+    console.error(`[Warmup] Failed to pre-fetch table list: ${err.message}`);
+  });
 });
