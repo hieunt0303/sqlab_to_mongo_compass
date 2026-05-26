@@ -385,7 +385,7 @@ async function processCommand(
 
     // Call upstream SQL API or return local mock simulation
     const startTime = Date.now();
-    const documents = await fetchDataFromUpstream(collectionName, phoneFilter);
+    const documents = await fetchDataFromUpstream(collectionName, filter);
     const duration = Date.now() - startTime;
     console.log(`${CLR_SUCCESS}[Socket #${socketId}] Upstream query resolved in ${duration}ms. Returned ${documents.length} rows.${CLR_RESET}`);
 

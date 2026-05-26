@@ -362,19 +362,131 @@ function rawParseTabularResponse(response: any): any[] {
 }
 
 /**
+ * Translates a MongoDB/BSON filter object into a SQL WHERE clause.
+ * Supports standard equality, nested operators ($eq, $ne, $in, $nin, $gt, $gte, $lt, $lte), logical $and conjunctions,
+ * and maps keys back to correct SQL columns.
+ */
+function translateMongoFilterToSql(filter: any): string {
+  if (!filter || typeof filter !== 'object' || Object.keys(filter).length === 0) {
+    return '';
+  }
+
+  // Translates MongoDB dot-notation (0-based) to Trino/Presto ROW/ARRAY paths (1-based index)
+  const translateMongoKeyToSql = (key: string): string => {
+    const parts = key.split('.');
+    const sqlParts: string[] = [];
+
+    // Map of camelCase MongoDB fields to lowercase SQL columns/fields
+    const fieldMapping: Record<string, string> = {
+      campaignId: 'campaignid',
+      createdAt: 'createdat',
+      bookingCode: 'bookingcode',
+      quotaPayload: 'quotapayload',
+    };
+
+    const normalizePart = (part: string): string => {
+      if (fieldMapping[part]) return fieldMapping[part];
+      return part.toLowerCase();
+    };
+
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      
+      // Check if the next part is a number (representing array index)
+      if (i + 1 < parts.length && /^\d+$/.test(parts[i + 1])) {
+        const index = parseInt(parts[i + 1], 10) + 1; // 0-based to 1-based
+        sqlParts.push(`${normalizePart(part)}[${index}]`);
+        i++; // Skip the index part
+      } else {
+        sqlParts.push(normalizePart(part));
+      }
+    }
+
+    return sqlParts.join('.');
+  };
+
+  const formatValue = (val: any): string => {
+    if (val === null) return 'NULL';
+    if (typeof val === 'string') {
+      return `'${val.replace(/'/g, "''")}'`;
+    }
+    if (typeof val === 'number' || typeof val === 'boolean') {
+      return String(val);
+    }
+    if (val instanceof Date) {
+      return `'${val.toISOString()}'`;
+    }
+    return `'${JSON.stringify(val).replace(/'/g, "''")}'`;
+  };
+
+  const clauses: string[] = [];
+
+  for (const key of Object.keys(filter)) {
+    if (key.startsWith('$')) {
+      if (key === '$and' && Array.isArray(filter.$and)) {
+        const subClauses = filter.$and
+          .map((sub: any) => translateMongoFilterToSql(sub))
+          .filter((clause: string) => clause.length > 0);
+        if (subClauses.length > 0) {
+          clauses.push(`(${subClauses.join(' AND ')})`);
+        }
+      }
+      continue;
+    }
+
+    const val = filter[key];
+    const sqlKey = translateMongoKeyToSql(key);
+
+    // Handle nested operators, e.g. `{ phone: { $eq: "..." } }`
+    if (val && typeof val === 'object' && !Array.isArray(val) && !(val instanceof Date)) {
+      const ops = Object.keys(val);
+      for (const op of ops) {
+        if (op === '$eq') {
+          clauses.push(`${sqlKey} = ${formatValue(val.$eq)}`);
+        } else if (op === '$ne') {
+          clauses.push(`${sqlKey} != ${formatValue(val.$ne)}`);
+        } else if (op === '$in' && Array.isArray(val.$in)) {
+          const inVals = val.$in.map((v: any) => formatValue(v)).join(', ');
+          clauses.push(`${sqlKey} IN (${inVals})`);
+        } else if (op === '$nin' && Array.isArray(val.$nin)) {
+          const ninVals = val.$nin.map((v: any) => formatValue(v)).join(', ');
+          clauses.push(`${sqlKey} NOT IN (${ninVals})`);
+        } else if (op === '$gt') {
+          clauses.push(`${sqlKey} > ${formatValue(val.$gt)}`);
+        } else if (op === '$gte') {
+          clauses.push(`${sqlKey} >= ${formatValue(val.$gte)}`);
+        } else if (op === '$lt') {
+          clauses.push(`${sqlKey} < ${formatValue(val.$lt)}`);
+        } else if (op === '$lte') {
+          clauses.push(`${sqlKey} <= ${formatValue(val.$lte)}`);
+        }
+      }
+    } else {
+      // Simple equality
+      clauses.push(`${sqlKey} = ${formatValue(val)}`);
+    }
+  }
+
+  return clauses.join(' AND ');
+}
+
+/**
  * Triggers the upstream API or mock data based on connection status.
  */
-export async function fetchDataFromUpstream(collectionName: string, phoneFilter: string | null): Promise<any[]> {
+export async function fetchDataFromUpstream(collectionName: string, filter: any): Promise<any[]> {
+  const phoneFilter = filter?.phone || null;
+
   if (!isUpstreamConfigured()) {
     console.log(
-      `[Upstream] Upstream SQL editor is not configured. Serving local dynamic mock data for collection: "${collectionName}", phone: "${phoneFilter || 'ANY'}".`
+      `[Upstream] Upstream SQL editor is not configured. Serving local dynamic mock data for collection: "${collectionName}", filter: ${JSON.stringify(filter)}.`
     );
     return getMockData(collectionName, phoneFilter);
   }
 
-  // Dynamically craft SQL query targeting the exact database table
-  const sql = phoneFilter
-    ? `SELECT * from ${collectionName} WHERE phone = '${phoneFilter}';`
+  // Dynamically compile MongoDB BSON filter to standard SQL WHERE clause
+  const whereClause = translateMongoFilterToSql(filter);
+  const sql = whereClause
+    ? `SELECT * from ${collectionName} WHERE ${whereClause} LIMIT 100;`
     : `SELECT * from ${collectionName} LIMIT 100;`;
 
   const payload = {
