@@ -365,29 +365,68 @@ function rawParseTabularResponse(response: any): any[] {
  * Translates a MongoDB/BSON filter object into a SQL WHERE clause.
  * Supports standard equality, nested operators ($eq, $ne, $in, $nin, $gt, $gte, $lt, $lte), logical $and conjunctions,
  * and maps keys back to correct SQL columns.
+ *
+ * For paths containing numeric array indices (e.g. `request.quota.0.quotaPayload.client`),
+ * generates Trino `any_match()` predicates that iterate over the array and check nested field equality.
  */
 function translateMongoFilterToSql(filter: any): string {
   if (!filter || typeof filter !== 'object' || Object.keys(filter).length === 0) {
     return '';
   }
 
-  // Translates MongoDB dot-notation (0-based) to Trino/Presto ROW/ARRAY paths (1-based index)
+  // Trino's MongoDB connector lowercases all column/field names automatically,
+  // so we just need to lowercase any camelCase MongoDB field names for SQL queries.
+  const normalizePart = (part: string): string => part.toLowerCase();
+
+  /**
+   * Detects if a dotted MongoDB path contains a numeric array index segment.
+   * Example: "request.quota.0.quotaPayload.client" → index at position 2
+   */
+  const hasArrayIndex = (key: string): boolean => {
+    return key.split('.').some(part => /^\d+$/.test(part));
+  };
+
+  /**
+   * Builds a Trino `json_extract_scalar(column, '$.path[idx].to.field')` expression
+   * for MongoDB paths that traverse through nested JSON stored as VARCHAR columns.
+   *
+   * Example: "request.quota.0.quotaPayload.client" with value 'booking-tool'
+   * → json_extract_scalar(request, '$.quota[0].quotaPayload.client') = 'booking-tool'
+   *
+   * Note: JSON path keys preserve original MongoDB casing (camelCase) since
+   * they are keys inside the JSON content, not SQL column identifiers.
+   */
+  const buildJsonExtractClause = (key: string, operator: string, formattedValue: string): string => {
+    const parts = key.split('.');
+    // First segment is the SQL column name (lowercased)
+    const columnName = normalizePart(parts[0]);
+
+    // Build JSONPath from remaining segments, preserving original casing for JSON keys
+    const jsonPathSegments: string[] = [];
+    for (let i = 1; i < parts.length; i++) {
+      const part = parts[i];
+      if (/^\d+$/.test(part)) {
+        // Numeric array index: append [index] to the previous segment (JSONPath uses 0-based)
+        const lastIdx = jsonPathSegments.length - 1;
+        if (lastIdx >= 0) {
+          jsonPathSegments[lastIdx] = `${jsonPathSegments[lastIdx]}[${part}]`;
+        }
+      } else {
+        jsonPathSegments.push(part); // Preserve original casing for JSON keys
+      }
+    }
+
+    const jsonPath = `$.${jsonPathSegments.join('.')}`;
+    return `json_extract_scalar(${columnName}, '${jsonPath}') ${operator} ${formattedValue}`;
+  };
+
+  /**
+   * Translates a simple (non-array-traversing) MongoDB dot-notation key to Trino/Presto ROW path.
+   * Numeric segments are converted from 0-based to 1-based bracket indexing.
+   */
   const translateMongoKeyToSql = (key: string): string => {
     const parts = key.split('.');
     const sqlParts: string[] = [];
-
-    // Map of camelCase MongoDB fields to lowercase SQL columns/fields
-    const fieldMapping: Record<string, string> = {
-      campaignId: 'campaignid',
-      createdAt: 'createdat',
-      bookingCode: 'bookingcode',
-      quotaPayload: 'quotapayload',
-    };
-
-    const normalizePart = (part: string): string => {
-      if (fieldMapping[part]) return fieldMapping[part];
-      return part.toLowerCase();
-    };
 
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
@@ -419,6 +458,18 @@ function translateMongoFilterToSql(filter: any): string {
     return `'${JSON.stringify(val).replace(/'/g, "''")}'`;
   };
 
+  /**
+   * Generates a single SQL clause for a given key, operator, and value.
+   * Automatically detects nested array paths and uses any_match() for those.
+   */
+  const makeClause = (key: string, operator: string, formattedValue: string): string => {
+    if (hasArrayIndex(key)) {
+      return buildJsonExtractClause(key, operator, formattedValue);
+    }
+    const sqlKey = translateMongoKeyToSql(key);
+    return `${sqlKey} ${operator} ${formattedValue}`;
+  };
+
   const clauses: string[] = [];
 
   for (const key of Object.keys(filter)) {
@@ -435,35 +486,34 @@ function translateMongoFilterToSql(filter: any): string {
     }
 
     const val = filter[key];
-    const sqlKey = translateMongoKeyToSql(key);
 
     // Handle nested operators, e.g. `{ phone: { $eq: "..." } }`
     if (val && typeof val === 'object' && !Array.isArray(val) && !(val instanceof Date)) {
       const ops = Object.keys(val);
       for (const op of ops) {
         if (op === '$eq') {
-          clauses.push(`${sqlKey} = ${formatValue(val.$eq)}`);
+          clauses.push(makeClause(key, '=', formatValue(val.$eq)));
         } else if (op === '$ne') {
-          clauses.push(`${sqlKey} != ${formatValue(val.$ne)}`);
+          clauses.push(makeClause(key, '!=', formatValue(val.$ne)));
         } else if (op === '$in' && Array.isArray(val.$in)) {
           const inVals = val.$in.map((v: any) => formatValue(v)).join(', ');
-          clauses.push(`${sqlKey} IN (${inVals})`);
+          clauses.push(makeClause(key, 'IN', `(${inVals})`));
         } else if (op === '$nin' && Array.isArray(val.$nin)) {
           const ninVals = val.$nin.map((v: any) => formatValue(v)).join(', ');
-          clauses.push(`${sqlKey} NOT IN (${ninVals})`);
+          clauses.push(makeClause(key, 'NOT IN', `(${ninVals})`));
         } else if (op === '$gt') {
-          clauses.push(`${sqlKey} > ${formatValue(val.$gt)}`);
+          clauses.push(makeClause(key, '>', formatValue(val.$gt)));
         } else if (op === '$gte') {
-          clauses.push(`${sqlKey} >= ${formatValue(val.$gte)}`);
+          clauses.push(makeClause(key, '>=', formatValue(val.$gte)));
         } else if (op === '$lt') {
-          clauses.push(`${sqlKey} < ${formatValue(val.$lt)}`);
+          clauses.push(makeClause(key, '<', formatValue(val.$lt)));
         } else if (op === '$lte') {
-          clauses.push(`${sqlKey} <= ${formatValue(val.$lte)}`);
+          clauses.push(makeClause(key, '<=', formatValue(val.$lte)));
         }
       }
     } else {
       // Simple equality
-      clauses.push(`${sqlKey} = ${formatValue(val)}`);
+      clauses.push(makeClause(key, '=', formatValue(val)));
     }
   }
 
