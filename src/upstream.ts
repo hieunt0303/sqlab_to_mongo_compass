@@ -533,11 +533,22 @@ export async function fetchDataFromUpstream(collectionName: string, filter: any)
     return getMockData(collectionName, phoneFilter);
   }
 
-  // Dynamically compile MongoDB BSON filter to standard SQL WHERE clause
-  const whereClause = translateMongoFilterToSql(filter);
-  const sql = whereClause
-    ? `SELECT * from ${collectionName} WHERE ${whereClause} LIMIT 100;`
-    : `SELECT * from ${collectionName} LIMIT 100;`;
+  // Construct MongoDB filter payload for Trino passthrough to bypass strict schemas
+  const mongoQuery = {
+    $query: filter && Object.keys(filter).length > 0 ? filter : {},
+    $orderby: { _id: -1 }
+  };
+  // Escape single quotes for Trino SQL string literal
+  const filterString = JSON.stringify(mongoQuery).replace(/'/g, "''");
+
+  const catalogName = process.env.UPSTREAM_CATALOG || 'mongodb';
+  const sql = `SELECT * FROM TABLE(
+    "${catalogName}".system.query(
+        database => '${SCHEMA}',
+        collection => '${collectionName}',
+        filter => '${filterString}'
+    )
+) LIMIT 100;`;
 
   const payload = {
     client_id: generateClientId(),
@@ -559,7 +570,7 @@ export async function fetchDataFromUpstream(collectionName: string, filter: any)
 
   try {
     const url = 'https://query.urbox.services/api/v1/sqllab/execute/';
-    const response = await httpRequest(url, {
+    let response = await httpRequest(url, {
       method: 'POST',
       headers: {
         'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
@@ -579,15 +590,15 @@ export async function fetchDataFromUpstream(collectionName: string, filter: any)
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`[Upstream] API Request Failed with status ${response.status}: ${errorText}`);
-      throw new Error(`Upstream API failed: ${response.statusText}`);
+      throw new Error(`Upstream API failed: ${response.statusText}. Details: ${errorText.substring(0, 500)}`);
     }
 
     const data = await response.json();
     console.log('[Upstream] Success! Received response from Urbox SQL Service.');
     return parseTabularResponse(data);
   } catch (error: any) {
-    console.error(`[Upstream] Error querying SQL Service: ${error.message}. Falling back to mock data.`);
-    return getMockData(collectionName, phoneFilter);
+    console.error(`[Upstream] Error querying SQL Service: ${error.message}.`);
+    throw error;
   }
 }
 
