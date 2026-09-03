@@ -1,5 +1,9 @@
 import dotenv from 'dotenv';
 import https from 'https';
+import {
+  getSupersetSessionCookieFromChrome,
+  clearChromeCookieCache,
+} from './chromeCookie.js';
 
 // Load environment variables
 dotenv.config();
@@ -62,23 +66,179 @@ function generateClientId(): string {
   return result;
 }
 
-const CSRF_TOKEN = process.env.UPSTREAM_CSRF_TOKEN || '';
-const SESSION_COOKIE = process.env.UPSTREAM_SESSION_COOKIE || '';
+let cachedCsrfToken = process.env.UPSTREAM_CSRF_TOKEN || '';
+// When auto-loading the session cookie from Chrome, the stale .env CSRF token will
+// not match the live session, so discard it and always fetch a fresh, matching one.
+if (process.env.UPSTREAM_DISABLE_CHROME_COOKIE !== '1') {
+  cachedCsrfToken = '';
+}
+const ENV_SESSION_COOKIE = process.env.UPSTREAM_SESSION_COOKIE || '';
 const CLIENT_ID = process.env.UPSTREAM_CLIENT_ID || 'sVXsVidw3G';
 const DATABASE_ID = parseInt(process.env.UPSTREAM_DATABASE_ID || '28', 10);
 const SQL_EDITOR_ID = process.env.UPSTREAM_SQL_EDITOR_ID || '68';
 const SCHEMA = process.env.UPSTREAM_SCHEMA || 'public';
 
 /**
+ * Resolves the active Superset session cookie.
+ *
+ * Priority:
+ *   1. Live cookie auto-extracted from the local Google Chrome browser
+ *      (so you never have to copy it into `.env` again — just stay logged in).
+ *   2. Fallback to the UPSTREAM_SESSION_COOKIE value from `.env`.
+ *
+ * Set UPSTREAM_DISABLE_CHROME_COOKIE=1 to force using only the `.env` value.
+ */
+function getActiveSessionCookie(forceRefresh = false): string {
+  if (process.env.UPSTREAM_DISABLE_CHROME_COOKIE !== '1') {
+    const chromeCookie = getSupersetSessionCookieFromChrome(forceRefresh);
+    if (chromeCookie) {
+      return chromeCookie;
+    }
+    console.warn(
+      '[Upstream] Could not auto-load session cookie from Chrome. Falling back to .env value.'
+    );
+  }
+  return ENV_SESSION_COOKIE;
+}
+
+/**
+ * Formats a raw session cookie value into a proper Cookie header string.
+ */
+function buildCookieHeader(sessionValue: string): string {
+  return sessionValue.includes('=') ? sessionValue : `session=${sessionValue}`;
+}
+
+/**
  * Checks if the upstream credentials are configured.
  */
 function isUpstreamConfigured(): boolean {
-  return (
-    CSRF_TOKEN !== '' &&
-    CSRF_TOKEN !== 'YOUR_CSRF_TOKEN_HERE' &&
-    SESSION_COOKIE !== '' &&
-    SESSION_COOKIE !== 'YOUR_SESSION_COOKIE_HERE'
-  );
+  const cookie = getActiveSessionCookie();
+  return cookie !== '' && cookie !== 'YOUR_SESSION_COOKIE_HERE';
+}
+
+/**
+ * Retrieves the current CSRF token, either from cache or by fetching it dynamically
+ * from the SQL Lab page using the session cookie.
+ */
+async function getOrFetchCsrfToken(forceRefresh = false): Promise<string> {
+  if (cachedCsrfToken && !forceRefresh) {
+    return cachedCsrfToken;
+  }
+
+  const sessionCookie = getActiveSessionCookie(forceRefresh);
+  if (!sessionCookie || sessionCookie === 'YOUR_SESSION_COOKIE_HERE') {
+    return '';
+  }
+
+  console.log('[Upstream] Fetching fresh CSRF token dynamically from SQL Lab...');
+  try {
+    const url = 'https://query.urbox.services/sqllab/';
+    const response = await httpRequest(url, {
+      method: 'GET',
+      headers: {
+        'Cookie': buildCookieHeader(sessionCookie),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch page. Status: ${response.status}`);
+    }
+
+    const html = await response.text();
+    const inputRegex = /<input\s+([^>]+)>/gis;
+    let match;
+    while ((match = inputRegex.exec(html)) !== null) {
+      const attrs = match[1];
+      if (attrs.includes('id="csrf_token"') || attrs.includes('name="csrf_token"')) {
+        const cleanAttrs = attrs.replace(/\s+/g, ' ');
+        const valueMatch = cleanAttrs.match(/value="([^"]+)"/i);
+        if (valueMatch) {
+          cachedCsrfToken = valueMatch[1];
+          console.log(`[Upstream] Successfully obtained fresh CSRF token: ${cachedCsrfToken.substring(0, 15)}...`);
+          return cachedCsrfToken;
+        }
+      }
+    }
+    throw new Error('CSRF input tag not found in the HTML response');
+  } catch (err: any) {
+    console.error(`[Upstream] Error fetching dynamic CSRF token: ${err.message}`);
+    return '';
+  }
+}
+
+/**
+ * Internal helper to execute a SQL query on the upstream SQL editor API.
+ * Handles automatic dynamic CSRF token retrieval and retries.
+ */
+async function executeSqlUpstream(sql: string): Promise<any> {
+  let csrf = await getOrFetchCsrfToken();
+  const url = 'https://query.urbox.services/api/v1/sqllab/execute/';
+  
+  const buildPayload = () => ({
+    client_id: generateClientId(),
+    database_id: DATABASE_ID,
+    json: true,
+    runAsync: false,
+    schema: SCHEMA,
+    sql: sql,
+    sql_editor_id: SQL_EDITOR_ID,
+    tab: "Untitled Query 8",
+    tmp_table_name: "",
+    select_as_cta: false,
+    ctas_method: "TABLE",
+    queryLimit: 10000,
+    expand_data: true,
+  });
+
+  const runRequest = async (token: string) => {
+    return await httpRequest(url, {
+      method: 'POST',
+      headers: {
+        'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
+        'X-CSRFToken': token,
+        'Cookie': buildCookieHeader(getActiveSessionCookie()),
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Referer': 'https://query.urbox.services/sqllab/',
+        'Origin': 'https://query.urbox.services',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+      },
+      body: JSON.stringify(buildPayload()),
+    });
+  };
+
+  let response = await runRequest(csrf);
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    const isCsrfError = response.status === 400 || 
+                        errorText.toLowerCase().includes('csrf') || 
+                        response.statusText.toLowerCase().includes('csrf');
+                        
+    if (isCsrfError) {
+      console.warn('[Upstream] CSRF/session verification failed or expired. Re-reading cookie from Chrome and retrying...');
+      // Invalidate the cached Chrome cookie so we re-read the freshest one,
+      // then fetch a matching CSRF token for that session.
+      clearChromeCookieCache();
+      csrf = await getOrFetchCsrfToken(true);
+      if (csrf) {
+        response = await runRequest(csrf);
+        if (response.ok) {
+          console.log('[Upstream] Retry succeeded with refreshed session + CSRF token.');
+          return await response.json();
+        }
+      }
+    }
+    
+    console.error(`[Upstream] API Request Failed with status ${response.status}: ${errorText}`);
+    throw new Error(`Upstream API failed: ${response.statusText}. Details: ${errorText.substring(0, 500)}`);
+  }
+
+  return await response.json();
 }
 
 /**
@@ -534,10 +694,7 @@ export async function fetchDataFromUpstream(collectionName: string, filter: any)
   }
 
   // Construct MongoDB filter payload for Trino passthrough to bypass strict schemas
-  const mongoQuery = {
-    $query: filter && Object.keys(filter).length > 0 ? filter : {},
-    $orderby: { _id: -1 }
-  };
+  const mongoQuery = filter && Object.keys(filter).length > 0 ? filter : {};
   // Escape single quotes for Trino SQL string literal
   const filterString = JSON.stringify(mongoQuery).replace(/'/g, "''");
 
@@ -550,50 +707,10 @@ export async function fetchDataFromUpstream(collectionName: string, filter: any)
     )
 ) LIMIT 100;`;
 
-  const payload = {
-    client_id: generateClientId(),
-    database_id: DATABASE_ID,
-    json: true,
-    runAsync: false,
-    schema: SCHEMA,
-    sql: sql,
-    sql_editor_id: SQL_EDITOR_ID,
-    tab: "Untitled Query 8",
-    tmp_table_name: "",
-    select_as_cta: false,
-    ctas_method: "TABLE",
-    queryLimit: 10000,
-    expand_data: true,
-  };
-
   console.log(`[Upstream] Dispatching upstream query SQL: "${sql}"`);
 
   try {
-    const url = 'https://query.urbox.services/api/v1/sqllab/execute/';
-    let response = await httpRequest(url, {
-      method: 'POST',
-      headers: {
-        'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
-        'X-CSRFToken': CSRF_TOKEN,
-        'Cookie': SESSION_COOKIE.includes('=') ? SESSION_COOKIE : `session=${SESSION_COOKIE}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Referer': 'https://query.urbox.services/sqllab/',
-        'Origin': 'https://query.urbox.services',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[Upstream] API Request Failed with status ${response.status}: ${errorText}`);
-      throw new Error(`Upstream API failed: ${response.statusText}. Details: ${errorText.substring(0, 500)}`);
-    }
-
-    const data = await response.json();
+    const data = await executeSqlUpstream(sql);
     console.log('[Upstream] Success! Received response from Urbox SQL Service.');
     return parseTabularResponse(data);
   } catch (error: any) {
@@ -630,48 +747,11 @@ export async function fetchTablesListFromUpstream(): Promise<string[]> {
 
   isFetchingTables = true;
   const sql = 'SHOW TABLES;';
-  const payload = {
-    client_id: generateClientId(),
-    database_id: DATABASE_ID,
-    json: true,
-    runAsync: false,
-    schema: SCHEMA,
-    sql: sql,
-    sql_editor_id: SQL_EDITOR_ID,
-    tab: "Untitled Query 8",
-    tmp_table_name: "",
-    select_as_cta: false,
-    ctas_method: "TABLE",
-    queryLimit: 10000,
-    expand_data: true,
-  };
 
   console.log(`[Upstream] Fetching all tables in schema using SQL: "${sql}"`);
 
   try {
-    const url = 'https://query.urbox.services/api/v1/sqllab/execute/';
-    const response = await httpRequest(url, {
-      method: 'POST',
-      headers: {
-        'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
-        'X-CSRFToken': CSRF_TOKEN,
-        'Cookie': SESSION_COOKIE.includes('=') ? SESSION_COOKIE : `session=${SESSION_COOKIE}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Referer': 'https://query.urbox.services/sqllab/',
-        'Origin': 'https://query.urbox.services',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Upstream API failed: ${response.statusText}`);
-    }
-
-    const responseData = await response.json();
+    const responseData = await executeSqlUpstream(sql);
     const results = Array.isArray(responseData.data) 
       ? responseData.data 
       : (responseData.results || responseData.data?.results || responseData.rows || responseData.data?.rows);

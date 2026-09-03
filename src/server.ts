@@ -401,6 +401,22 @@ async function processCommand(
     console.log(`${CLR_QUERY}[Socket #${socketId}] INTERCEPTED Find Command for collection: "${collectionName}"${CLR_RESET}`);
     console.log(`${CLR_QUERY}[Socket #${socketId}] BSON filter details: ${JSON.stringify(filter)}${CLR_RESET}`);
 
+    // Ignore internal MongoDB Compass metadata queries to avoid Trino errors
+    if (dbName === 'admin' || dbName === 'config' || dbName === 'local' || collectionName === 'collections' || collectionName.startsWith('system.')) {
+      console.log(`${CLR_INFO}[Socket #${socketId}] Ignored internal metadata query for DB: "${dbName}", Collection: "${collectionName}"${CLR_RESET}`);
+      const emptyResponse = {
+        cursor: {
+          firstBatch: [],
+          id: 0n,
+          ns: `${dbName}.${collectionName}`,
+        },
+        ok: 1.0,
+      };
+      return header.opCode === OpCode.OP_QUERY
+        ? buildOpReply(header.requestId, [emptyResponse])
+        : buildOpMsg(header.requestId, emptyResponse);
+    }
+
     // Extract search constraints (specifically 'phone')
     const phoneFilter = extractPhoneFilter(filter);
     if (phoneFilter) {
